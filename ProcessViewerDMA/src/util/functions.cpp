@@ -70,128 +70,247 @@ bool FixCr3(DWORD pid, std::string proc_name)
 bool Read(DWORD pid, uintptr_t address, void* buffer, size_t size)
 {
 	DWORD read_size = 0;
-	if (!VMMDLL_MemReadEx(DMA::Handle, pid, address, (PBYTE)buffer, size, &read_size, VMMDLL_FLAG_NOCACHE))
+	ULONG64 flags = VMMDLL_FLAG_NOCACHE | VMMDLL_FLAG_NOCACHEPUT | VMMDLL_FLAG_ZEROPAD_ON_FAIL;
+	if (!VMMDLL_MemReadEx(DMA::Handle, pid, address, (PBYTE)buffer, size, &read_size, flags))
+	{
 		return false;
+	}
 
-	return (size == read_size);
+	return true;
 }
 
 bool DumpMemory(DWORD pid, std::string module_name)
 {
-	PVMMDLL_MAP_MODULEENTRY module_entry = NULL;
-	bool result = VMMDLL_Map_GetModuleFromNameU(DMA::Handle, pid, const_cast<LPSTR>(module_name.c_str()), &module_entry, NULL);
-	if (!result) return false;
+    PVMMDLL_MAP_MODULEENTRY module_entry = NULL;
+    bool result = VMMDLL_Map_GetModuleFromNameU(DMA::Handle, pid, const_cast<LPSTR>(module_name.c_str()), &module_entry, NULL);
+    if (!result) return false;
 
-	/*PVMMDLL_MAP_VAD pVadMap = NULL;
-	if (VMMDLL_Map_GetVadU(DMA::Handle, pid, TRUE, &pVadMap)) {
-		for (DWORD i = 0; i < pVadMap->cMap; i++) {
-			auto& vad = pVadMap->pMap[i];
-			VMMDLL_MemPrefetchPages(DMA::Handle, pid, &vad.vaStart, (vad.vaEnd - vad.vaStart) / 0x1000);
-		}
-		VMMDLL_MemFree(pVadMap);
-	}*/
+    BYTE* buffer = (PBYTE)malloc(module_entry->cbImageSize);
+    if (!buffer)
+    {
+        printf("[-] Failed to allocate memory for buffer\n");
+        return false;
+    }
 
-	PIMAGE_SECTION_HEADER sections = nullptr;
-	DWORD num_sections = 0;
-	if (!VMMDLL_ProcessGetSectionsU(DMA::Handle, pid, const_cast<LPSTR>(module_name.c_str()), NULL, 0, &num_sections))
-	{
-		printf("[-] Failed To Get Number Of Memory Sections\n");
-		return false;
-	}
-	sections = new IMAGE_SECTION_HEADER[num_sections];
+    std::vector<ULONG> failed_reads;
 
-	if (!VMMDLL_ProcessGetSectionsU(DMA::Handle, pid, const_cast<LPSTR>(module_name.c_str()), sections, num_sections, &num_sections))
-	{
-		printf("[-] Failed To Get Memory Sections\n");
-		delete[] sections;
-		return false;
-	}
+    // Read the module's memory into buffer
+    for (ULONG i = 0x0; i < module_entry->cbImageSize - 0x1000; i += 0x1000)
+    {
+        if (!Read(pid, module_entry->vaBase + i, buffer + i, 0x1000))
+        {
+            failed_reads.push_back(i);
+        }
+    }
 
+    // Retry failed reads with smaller chunks
+    for (int i = 0; i < failed_reads.size(); i++)
+    {
+        for (int offset = 0; offset < 0x10; offset++)
+        {
+            Read(pid, module_entry->vaBase + failed_reads[i] * offset, buffer + failed_reads[i] * offset, 0x100);
+        }
+    }
 
+    printf("[+] Successfully Read Memory Into Buffer\n");
 
-	BYTE* buffer = (PBYTE)malloc(module_entry->cbImageSize);
-	if (!buffer) 
-	{
-		printf("[-] Failed to allocate memory for buffer\n");
-		return false;
-	}
+    auto pdos_header = reinterpret_cast<PIMAGE_DOS_HEADER>(buffer);
 
-	for (ULONG i = 0x0; i < module_entry->cbImageSize; i += 0x100)
-	{
-		if (!Read(pid, module_entry->vaBase + i, buffer + i, 0x100))
-		{
-			printf("[-] Failed Read On %llxn\n", module_entry->vaBase + i);
-		}
-	}
-	printf("[+] Successfully Read Memory Into Buffer\n");
+    if (!pdos_header->e_lfanew)
+    {
+        printf("[!] Failed to get dos header from buffer\n");
+        free(buffer);
+        return false;
+    }
 
-	auto pdos_header = reinterpret_cast<PIMAGE_DOS_HEADER>(buffer);
+    printf("[+] Dos header read: %p\n", pdos_header);
 
-	if (!pdos_header->e_lfanew)
-	{
-		printf("[!] Failed to get dos header from buffer\n");
-		free(buffer);
-		return false;
-	}
+    if (pdos_header->e_magic != IMAGE_DOS_SIGNATURE)
+    {
+        printf("[!] Invalid dos header signature\n");
+        free(buffer);
+        return false;
+    }
 
-	printf("[+] Dos header readed: %p\n", pdos_header);
+    auto pnt_header = reinterpret_cast<PIMAGE_NT_HEADERS>(buffer + pdos_header->e_lfanew);
 
-	if (pdos_header->e_magic != IMAGE_DOS_SIGNATURE)
-	{
-		printf("[!] Invalid dos header signature\n");
-		free(buffer);
-		return false;
-	}
+    if (!pnt_header)
+    {
+        printf("[!] Failed to read nt header from buffer\n");
+        free(buffer);
+        return false;
+    }
 
-	auto pnt_header = reinterpret_cast<PIMAGE_NT_HEADERS>(buffer + pdos_header->e_lfanew);
+    printf("[+] NT header read: 0x%p\n", pnt_header);
 
-	if (!pnt_header)
-	{
-		printf("[!] Failed to read nt header from buffer\n");
-		free(buffer);
-		return false;
-	}
+    if (pnt_header->Signature != IMAGE_NT_SIGNATURE)
+    {
+        printf("[!] Invalid nt header signature from read nt header\n");
+        free(buffer);
+        return false;
+    }
 
-	printf("[+] Nt header readed: 0x%p\n", pnt_header);
+    auto poptional_header = reinterpret_cast<PIMAGE_OPTIONAL_HEADER>(&pnt_header->OptionalHeader);
 
-	if (pnt_header->Signature != IMAGE_NT_SIGNATURE)
-	{
-		printf("[!] Invalid nt header signature from readed nt header\n");
-		free(buffer);
-		return false;
-	}
+    if (!poptional_header)
+    {
+        printf("[!] Failed to read optional header from buffer\n");
+        free(buffer);
+        return false;
+    }
 
-	auto poptional_header = reinterpret_cast<PIMAGE_OPTIONAL_HEADER>(&pnt_header->OptionalHeader);
+    printf("[+] Optional header read: 0x%p\n", poptional_header);
 
-	if (!poptional_header)
-	{
-		printf("[!] Failed to read optional header from buffer\n");
-		free(buffer);
-		return false;
-	}
+    unsigned int section_offset = poptional_header->SizeOfHeaders;
 
-	printf("[+] Optional header readed: 0x%p\n", poptional_header);
+    // Read Sections
+    for (int i = 0; i < pnt_header->FileHeader.NumberOfSections; i++)
+    {
+        PIMAGE_SECTION_HEADER psection_header = IMAGE_FIRST_SECTION(pnt_header) + i;
+        psection_header->Misc.VirtualSize = psection_header->SizeOfRawData;
 
-	int i = 0;
-	unsigned int section_offset = poptional_header->SizeOfHeaders;
+        memcpy(buffer + section_offset, psection_header, sizeof(IMAGE_SECTION_HEADER));
+        section_offset += sizeof(IMAGE_SECTION_HEADER);
 
-	for (
-		PIMAGE_SECTION_HEADER psection_header = IMAGE_FIRST_SECTION(pnt_header);
-		i < pnt_header->FileHeader.NumberOfSections;
-		i++, psection_header++
-		)
-	{
-		psection_header->Misc.VirtualSize = psection_header->SizeOfRawData;
+        Read(pid, poptional_header->ImageBase + psection_header->VirtualAddress, buffer + psection_header->PointerToRawData, psection_header->SizeOfRawData);
+    }
 
-		memcpy(buffer + section_offset, psection_header, sizeof(IMAGE_SECTION_HEADER));
-		section_offset += sizeof(IMAGE_SECTION_HEADER);
+    // Rebuild Import Table
+    PIMAGE_DATA_DIRECTORY importDir = &poptional_header->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (importDir->VirtualAddress != 0)
+    {
+        PIMAGE_IMPORT_DESCRIPTOR importDesc = reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(buffer + importDir->VirtualAddress);
 
-		Read(pid, poptional_header->ImageBase + psection_header->VirtualAddress, buffer + psection_header->PointerToRawData, psection_header->SizeOfRawData);
-	}
+        while (importDesc->Name)
+        {
+            char* moduleName = (char*)buffer + importDesc->Name;
+            printf("[+] Rebuilding import: %s\n", moduleName);
 
-	std::ofstream Dump(module_name.c_str(), std::ios::binary);
-	Dump.write((char*)buffer, module_entry->cbImageSize);
-	Dump.close();
+            PVMMDLL_MAP_IAT iatMap = nullptr;
+            if (!VMMDLL_Map_GetIATU(DMA::Handle, pid, moduleName, &iatMap))
+            {
+                printf("[-] Failed to get import address table for %s\n", moduleName);
+                importDesc++;
+                continue;
+            }
 
-	return true;
+            PIMAGE_THUNK_DATA originalThunk = reinterpret_cast<PIMAGE_THUNK_DATA>(buffer + importDesc->OriginalFirstThunk);
+            PIMAGE_THUNK_DATA firstThunk = reinterpret_cast<PIMAGE_THUNK_DATA>(buffer + importDesc->FirstThunk);
+
+            while (originalThunk->u1.Function)
+            {
+                if (originalThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG)
+                {
+                    // If it's an ordinal, we resolve by ordinal
+                    DWORD ordinal = originalThunk->u1.Ordinal & 0xFFFF;
+                    FARPROC procAddr = nullptr;
+
+                    for (DWORD i = 0; i < iatMap->cMap; i++)
+                    {
+                        if (iatMap->pMap[i].Thunk.rvaFirstThunk == ordinal)
+                        {
+                            procAddr = reinterpret_cast<FARPROC>(iatMap->pMap[i].vaFunction);
+                            break;
+                        }
+                    }
+
+                    if (procAddr)
+                    {
+                        firstThunk->u1.Function = reinterpret_cast<DWORD_PTR>(procAddr);
+                        printf("[+] Resolved ordinal: 0x%x to address: 0x%p\n", ordinal, procAddr);
+                    }
+                    else
+                    {
+                        printf("[-] Failed to resolve ordinal: 0x%x\n", ordinal);
+                    }
+                }
+                else
+                {
+                    PIMAGE_IMPORT_BY_NAME importByName = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(buffer + originalThunk->u1.AddressOfData);
+                    char* functionName = (char*)importByName->Name;
+                    FARPROC procAddr = nullptr;
+
+                    // Search the IAT map for the function name
+                    for (DWORD i = 0; i < iatMap->cMap; i++)
+                    {
+                        if (strcmp(functionName, (char*)iatMap->pbMultiText + iatMap->pMap[i].Thunk.rvaNameFunction) == 0)
+                        {
+                            procAddr = reinterpret_cast<FARPROC>(iatMap->pMap[i].vaFunction);
+                            break;
+                        }
+                    }
+
+                    if (procAddr)
+                    {
+                        firstThunk->u1.Function = reinterpret_cast<DWORD_PTR>(procAddr);
+                        printf("[+] Resolved function: %s to address: 0x%p\n", functionName, procAddr);
+                    }
+                    else
+                    {
+                        printf("[-] Failed to resolve function: %s\n", functionName);
+                    }
+                }
+
+                originalThunk++;
+                firstThunk++;
+            }
+
+            VMMDLL_MemFree(iatMap);
+            importDesc++;
+        }
+    }
+
+    // Rebuild Export Table
+    PIMAGE_DATA_DIRECTORY exportDir = &poptional_header->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (exportDir->VirtualAddress != 0)
+    {
+        PIMAGE_EXPORT_DIRECTORY exportDesc = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(buffer + exportDir->VirtualAddress);
+        printf("[+] Rebuilding export table\n");
+
+        // Extract pointers to export addresses, names, and ordinals
+        DWORD* addressOfNames = reinterpret_cast<DWORD*>(buffer + exportDesc->AddressOfNames);
+        WORD* addressOfNameOrdinals = reinterpret_cast<WORD*>(buffer + exportDesc->AddressOfNameOrdinals);
+        DWORD* addressOfFunctions = reinterpret_cast<DWORD*>(buffer + exportDesc->AddressOfFunctions);
+
+        // Iterate over the number of functions to rebuild the export table
+        for (DWORD i = 0; i < exportDesc->NumberOfNames; i++)
+        {
+            // Retrieve the name of the exported function
+            char* functionName = reinterpret_cast<char*>(buffer + addressOfNames[i]);
+            printf("[+] Rebuilding export function: %s\n", functionName);
+
+            // Retrieve the function's ordinal and corresponding address in the export table
+            WORD ordinal = addressOfNameOrdinals[i];
+            DWORD functionRVA = addressOfFunctions[ordinal];
+
+            // Find the corresponding function's address (you might need to resolve this address based on the context)
+            FARPROC procAddr = reinterpret_cast<FARPROC>(functionRVA + poptional_header->ImageBase);
+
+            if (procAddr)
+            {
+                // Update the function's address in the export table
+                addressOfFunctions[ordinal] = reinterpret_cast<DWORD>(procAddr);
+                printf("[+] Updated export function: %s to address: 0x%p\n", functionName, procAddr);
+            }
+            else
+            {
+                printf("[-] Failed to resolve export function: %s\n", functionName);
+            }
+        }
+    }
+
+    // Write the modified memory back to the file (dump it)
+    std::ofstream Dump(module_name.c_str(), std::ios::binary);
+    if (!Dump.is_open())
+    {
+        printf("[-] Failed to open dump file\n");
+        free(buffer);
+        return false;
+    }
+
+    Dump.write((char*)buffer, module_entry->cbImageSize);
+    Dump.close();
+
+    free(buffer);
+    return true;
 }
